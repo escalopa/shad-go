@@ -2,7 +2,25 @@
 
 package waitgroup
 
-var panicErr = &struct{}{}
+type Mutex struct {
+	channel chan struct{}
+}
+
+func NewMutex() *Mutex {
+	return &Mutex{channel: make(chan struct{}, 1)}
+}
+
+func (m *Mutex) Lock() {
+	m.channel <- struct{}{}
+}
+
+func (m *Mutex) Unlock() {
+	select {
+	case <-m.channel:
+	default:
+		panic("unlock of unlocked Mutex")
+	}
+}
 
 // A WaitGroup waits for a collection of goroutines to finish.
 // The main goroutine calls Add to set the number of
@@ -11,56 +29,19 @@ var panicErr = &struct{}{}
 // Wait can be used to block until all goroutines have finished.
 type WaitGroup struct {
 	counter int
-
-	wait    chan struct{}  // for synchronization of Wait
-	done    chan *struct{} // for synchronization of Add
-	channel chan int
+	channel chan struct{}
+	mutex   Mutex
 }
 
 // New creates WaitGroup.
 func New() *WaitGroup {
 	wg := &WaitGroup{
-		channel: make(chan int),
-		done:    make(chan *struct{}),
-		wait:    make(chan struct{}),
+		channel: make(chan struct{}, 1),
+		mutex: Mutex{
+			channel: make(chan struct{}, 1),
+		},
 	}
-	close(wg.wait) // Wait should not block initially
-	wg.run()
 	return wg
-}
-
-func (wg *WaitGroup) run() {
-	go func() {
-		for v := range wg.channel {
-			wg.counter += v
-			if wg.counter < 0 {
-				wg.counter -= v
-				wg.done <- panicErr
-				continue
-			}
-			wg.updateWait()
-			wg.done <- nil
-		}
-	}()
-}
-
-func (wg *WaitGroup) updateWait() {
-	var isClosed bool
-	select {
-	case <-wg.wait:
-		isClosed = true
-	default:
-	}
-
-	// case when the counter was zero(and currently not) and the wait channel was closed
-	if wg.counter != 0 && isClosed {
-		wg.wait = make(chan struct{})
-	}
-
-	// case when the counter is zero and the wait channel is open
-	if wg.counter == 0 && !isClosed {
-		close(wg.wait)
-	}
 }
 
 // Add adds delta, which may be negative, to the WaitGroup counter.
@@ -77,9 +58,20 @@ func (wg *WaitGroup) updateWait() {
 // new Add calls must happen after all previous Wait calls have returned.
 // See the WaitGroup example.
 func (wg *WaitGroup) Add(delta int) {
-	wg.channel <- delta
-	if res := <-wg.done; res == panicErr {
+	wg.mutex.Lock()
+	defer wg.mutex.Unlock()
+
+	if wg.counter == 0 && delta > 0 {
+		wg.channel <- struct{}{}
+	}
+
+	wg.counter += delta
+	if wg.counter < 0 {
 		panic("negative WaitGroup counter")
+	}
+
+	if wg.counter == 0 {
+		<-wg.channel
 	}
 }
 
@@ -90,5 +82,6 @@ func (wg *WaitGroup) Done() {
 
 // Wait blocks until the WaitGroup counter is zero.
 func (wg *WaitGroup) Wait() {
-	<-wg.wait // wait for the counter to be zero
+	wg.channel <- struct{}{}
+	<-wg.channel
 }
